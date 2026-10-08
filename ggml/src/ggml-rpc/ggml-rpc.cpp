@@ -2803,12 +2803,12 @@ static bool rpc_streq_ci(const char * a, const char * b) {
     if (a == nullptr || b == nullptr) {
         return false;
     }
-    for (; *a != \0 && *b != \0; a++, b++) {
+    for (; *a != '\0' && *b != '\0'; a++, b++) {
         if (rpc_upper(*a) != rpc_upper(*b)) {
             return false;
         }
     }
-    return *a == \0 && *b == \0;
+    return *a == '\0' && *b == '\0';
 }
 
 // Reads the GPU model the kernel knows about. kgsl names it "Adreno740" or
@@ -2829,7 +2829,7 @@ static enum rpc_adreno_gen rpc_probe_adreno_gen() {
     }
 
     int model = -1;
-    for (const char * p = buf; *p != \0; p++) {
+    for (const char * p = buf; *p != '\0'; p++) {
         if (*p < '0' || *p > '9') {
             continue;
         }
@@ -2863,7 +2863,7 @@ static enum rpc_adreno_gen rpc_probe_adreno_gen() {
 // The configured floor, as a rank, or one of the two sentinels.
 static int rpc_gpu_min_adreno_rank() {
     const char * env = getenv("GGML_RPC_GPU_MIN_ADRENO_GEN");
-    if (env == nullptr || env[0] == \0) {
+    if (env == nullptr || env[0] == '\0') {
         return (int) RPC_ADRENO_A8X;
     }
     if (rpc_streq_ci(env, "off") || rpc_streq_ci(env, "0")) {
