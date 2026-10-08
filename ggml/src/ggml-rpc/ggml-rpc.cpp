@@ -18,6 +18,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -2748,6 +2750,152 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+// ---------------------------------------------------------------------------
+// Old-Adreno guard (PROJECT_BRAIN 213.17).
+//
+// A node whose GPU is an Adreno 7xx or older makes a pool slower, not faster. The
+// kernel-selection guards in the OpenCL backend decline so much on those generations
+// - some for correct output, some because the E031.41 compiler miscompiles the kernel
+// - that the scheduler ends up carrying nearly every op back and forth across the
+// host/device boundary, and the node lands below its own CPU-only speed: a phone whose
+// GPU alone gives tens of tokens per second served the pool at 0.76 t/s, while the
+// same phone on the CPU alone gives 10+.
+//
+// So the server reads the chip at startup and refuses to offer a GPU it has positively
+// identified as too old, rather than let one such node drag the cluster down. A device
+// it cannot place is left alone - a desktop node has no kgsl to read, and guessing
+// there would cost a good GPU for nothing.
+//
+// GGML_RPC_GPU_MIN_ADRENO_GEN sets the floor: A8X (the default), A7X, A6X, "none" to
+// refuse every non-CPU device, or "off" to switch the guard off entirely.
+//
+// The floor is provisional until the A7X question in 213.17 is settled. If the collapse
+// turns out to be the code path rather than the silicon, the floor moves and this guard
+// stops being needed at all.
+// ---------------------------------------------------------------------------
+
+enum rpc_adreno_gen {
+    RPC_ADRENO_UNKNOWN = 0,
+    RPC_ADRENO_A6X     = 1,
+    RPC_ADRENO_A7X     = 2,
+    RPC_ADRENO_A8X     = 3,
+};
+
+// Two sentinels that are not ranks: the guard switched off, and a floor above every
+// chip there is.
+static const int RPC_ADRENO_FLOOR_OFF  = -1;
+static const int RPC_ADRENO_FLOOR_NONE = -2;
+
+static const char * rpc_adreno_gen_name(enum rpc_adreno_gen gen) {
+    switch (gen) {
+        case RPC_ADRENO_A6X: return "A6X";
+        case RPC_ADRENO_A7X: return "A7X";
+        case RPC_ADRENO_A8X: return "A8X";
+        default:             return "unknown";
+    }
+}
+
+static char rpc_upper(char c) {
+    return (c >= 'a' && c <= 'z') ? (char) (c - 'a' + 'A') : c;
+}
+
+static bool rpc_streq_ci(const char * a, const char * b) {
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    for (; *a != \0 && *b != \0; a++, b++) {
+        if (rpc_upper(*a) != rpc_upper(*b)) {
+            return false;
+        }
+    }
+    return *a == \0 && *b == \0;
+}
+
+// Reads the GPU model the kernel knows about. kgsl names it "Adreno740" or
+// "Adreno840v2"; the three-digit model is the identity, the trailing variant letter is
+// not. Returns RPC_ADRENO_UNKNOWN for anything we cannot place.
+static enum rpc_adreno_gen rpc_probe_adreno_gen() {
+    static const char * model_path = "/sys/class/kgsl/kgsl-3d0/gpu_model";
+
+    FILE * f = fopen(model_path, "rb");
+    if (f == nullptr) {
+        return RPC_ADRENO_UNKNOWN;
+    }
+    char buf[128] = {0};
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        return RPC_ADRENO_UNKNOWN;
+    }
+
+    int model = -1;
+    for (const char * p = buf; *p != \0; p++) {
+        if (*p < '0' || *p > '9') {
+            continue;
+        }
+        int value  = 0;
+        int digits = 0;
+        const char * q = p;
+        while (*q >= '0' && *q <= '9' && digits < 4) {
+            value = value * 10 + (*q - '0');
+            digits++;
+            q++;
+        }
+        if (digits == 3) {
+            model = value;
+            break;
+        }
+        p = q - 1;
+    }
+
+    if (model >= 800) {
+        return RPC_ADRENO_A8X;
+    }
+    if (model >= 700) {
+        return RPC_ADRENO_A7X;
+    }
+    if (model >= 600) {
+        return RPC_ADRENO_A6X;
+    }
+    return RPC_ADRENO_UNKNOWN;
+}
+
+// The configured floor, as a rank, or one of the two sentinels.
+static int rpc_gpu_min_adreno_rank() {
+    const char * env = getenv("GGML_RPC_GPU_MIN_ADRENO_GEN");
+    if (env == nullptr || env[0] == \0) {
+        return (int) RPC_ADRENO_A8X;
+    }
+    if (rpc_streq_ci(env, "off") || rpc_streq_ci(env, "0")) {
+        return RPC_ADRENO_FLOOR_OFF;
+    }
+    if (rpc_streq_ci(env, "none")) {
+        return RPC_ADRENO_FLOOR_NONE;
+    }
+    if (rpc_streq_ci(env, "A6X")) { return (int) RPC_ADRENO_A6X; }
+    if (rpc_streq_ci(env, "A7X")) { return (int) RPC_ADRENO_A7X; }
+    if (rpc_streq_ci(env, "A8X")) { return (int) RPC_ADRENO_A8X; }
+
+    fprintf(stderr, "GGML_RPC_GPU_MIN_ADRENO_GEN: unrecognised value '%s', guard off\n", env);
+    return RPC_ADRENO_FLOOR_OFF;
+}
+
+// True when this device must not be offered to a client.
+static bool rpc_device_is_refused(ggml_backend_dev_t dev, enum rpc_adreno_gen chip_gen, int min_rank) {
+    if (min_rank == RPC_ADRENO_FLOOR_OFF) {
+        return false;
+    }
+    // Only GPUs. The CPU is never refused, and an accelerator (Hexagon) is not subject
+    // to the Adreno kernel guards in the first place.
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    if (min_rank == RPC_ADRENO_FLOOR_NONE) {
+        return true;
+    }
+    return chip_gen != RPC_ADRENO_UNKNOWN && (int) chip_gen < min_rank;
+}
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
@@ -2761,11 +2909,33 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+
+    // See the old-Adreno guard above.
+    const enum rpc_adreno_gen chip_gen = rpc_probe_adreno_gen();
+    const int                 min_rank = rpc_gpu_min_adreno_rank();
+    if (min_rank == RPC_ADRENO_FLOOR_OFF) {
+        printf("  gpu guard      : off (GGML_RPC_GPU_MIN_ADRENO_GEN)\n");
+    } else {
+        printf("  gpu guard      : chip %s, floor %s\n", rpc_adreno_gen_name(chip_gen),
+               min_rank == RPC_ADRENO_FLOOR_NONE ? "none" : rpc_adreno_gen_name((enum rpc_adreno_gen) min_rank));
+    }
+    // The banner is read back out of a file after the run; do not let the block buffer
+    // reorder it against the messages that follow.
+    fflush(stdout);
+
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
+
+        if (rpc_device_is_refused(dev, chip_gen, min_rank)) {
+            printf("  %s: %s -- REFUSED, chip %s is below the floor; this node serves CPU only\n",
+                   ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), rpc_adreno_gen_name(chip_gen));
+            fflush(stdout);
+            continue;
+        }
+
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
                total / 1024 / 1024, free / 1024 / 1024);
         auto backend = ggml_backend_dev_init(dev, nullptr);
@@ -2781,6 +2951,12 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
                 ggml_backend_set_n_threads_fn(backend, n_threads);
             }
         }
+    }
+
+    if (backends.empty()) {
+        fprintf(stderr, "No device left to serve after the old-Adreno guard; pass a CPU device "
+                        "or set GGML_RPC_GPU_MIN_ADRENO_GEN=off\n");
+        return;
     }
 
     std::string host;
