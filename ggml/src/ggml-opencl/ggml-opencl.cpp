@@ -490,9 +490,16 @@ static void ggml_cl_adreno_xmem_attn_release_scratch(ggml_backend_opencl_context
 // backend device context
 // The small elementwise ops are left to the CPU while the op itself is no larger than
 // this many bytes. See the comment on ggml_opencl_op_is_small_elementwise.
-// 0 turns the rule off. The shipped value is the one the sweep in PROJECT_BRAIN 213.20
-// picked.
-#define GGML_OPENCL_SMALL_OPS_MAX_BYTES_DEFAULT 0
+// 0 turns the rule off.
+//
+// 3584 is the value the sweep in PROJECT_BRAIN 213.20 picked. The op sizes that matter
+// are set by the model geometry, not by taste: 3584 is the norm/add/ROPE-Q op of a
+// 0.5B, and 4096 is the smallest op a 8B ever produces. At 3584 the small model gains
+// its whole 46% (28.96 -> 42.42 t/s on Qwen2.5-0.5B Q4_K) while the large one is left
+// untouched, which is the point - every threshold that reaches a 8B op costs it speed,
+// and at 49152, where its SILU moves to the CPU, the model collapses to a fraction of
+// its speed. Raise this only with a sweep of your own; the trade is not linear.
+#define GGML_OPENCL_SMALL_OPS_MAX_BYTES_DEFAULT 3584
 
 struct ggml_backend_opencl_device_context {
     cl_platform_id platform;
