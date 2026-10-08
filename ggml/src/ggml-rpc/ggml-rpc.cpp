@@ -2876,8 +2876,12 @@ static int rpc_gpu_min_adreno_rank() {
     if (rpc_streq_ci(env, "A7X")) { return (int) RPC_ADRENO_A7X; }
     if (rpc_streq_ci(env, "A8X")) { return (int) RPC_ADRENO_A8X; }
 
-    fprintf(stderr, "GGML_RPC_GPU_MIN_ADRENO_GEN: unrecognised value '%s', guard off\n", env);
-    return RPC_ADRENO_FLOOR_OFF;
+    // Fail closed. A typo must not quietly delete the protection: an administrator who
+    // writes A9X means "refuse more", and a guard that vanishes is the one reading that
+    // cannot be what was wanted. The variable then behaves as if it were unset.
+    fprintf(stderr, "GGML_RPC_GPU_MIN_ADRENO_GEN: unrecognised value '%s', keeping the default floor %s\n",
+            env, rpc_adreno_gen_name((enum rpc_adreno_gen) RPC_ADRENO_A8X));
+    return (int) RPC_ADRENO_A8X;
 }
 
 // True when this device must not be offered to a client.
