@@ -1353,8 +1353,14 @@ private:
     void restore_tensor_extra(ggml_tensor * tensor, bool create_if_missing);
     void remember_tensor_extra(const ggml_tensor * tensor);
     void forget_tensor_extras(ggml_backend_buffer_t buffer);
+    void * find_tensor_extra(const ggml_tensor * tensor) const;
 
-    std::unordered_map<uint64_t, void *> tensor_extras;
+    // Filed per buffer rather than globally. A backend may report the same fake
+    // base for every one of its buffers - OpenCL reports its alignment (128), so
+    // every OpenCL buffer does - which makes tensor->data collide across buffers.
+    // Keyed on the data pointer alone, one buffer's state would be handed to
+    // another buffer's tensor.
+    std::unordered_map<ggml_backend_buffer_t, std::unordered_map<uint64_t, void *>> tensor_extras;
 
     void sync_all_backends();
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -1572,9 +1578,21 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 }
 
 // See the comment on tensor_extras in the class declaration.
+void * rpc_server::find_tensor_extra(const ggml_tensor * tensor) const {
+    if (tensor->buffer == nullptr || tensor->data == nullptr) {
+        return nullptr;
+    }
+    auto buf_it = tensor_extras.find(tensor->buffer);
+    if (buf_it == tensor_extras.end()) {
+        return nullptr;
+    }
+    auto it = buf_it->second.find((uint64_t) tensor->data);
+    return it == buf_it->second.end() ? nullptr : it->second;
+}
+
 void rpc_server::remember_tensor_extra(const ggml_tensor * tensor) {
-    if (tensor->extra != nullptr && tensor->data != nullptr) {
-        tensor_extras[(uint64_t) tensor->data] = tensor->extra;
+    if (tensor->extra != nullptr && tensor->data != nullptr && tensor->buffer != nullptr) {
+        tensor_extras[tensor->buffer][(uint64_t) tensor->data] = tensor->extra;
     }
 }
 
@@ -1584,9 +1602,9 @@ void rpc_server::restore_tensor_extra(ggml_tensor * tensor, bool create_if_missi
         return;
     }
 
-    auto it = tensor_extras.find((uint64_t) tensor->data);
-    if (it != tensor_extras.end()) {
-        tensor->extra = it->second;
+    void * stored = find_tensor_extra(tensor);
+    if (stored != nullptr) {
+        tensor->extra = stored;
         return;
     }
 
@@ -1603,11 +1621,11 @@ void rpc_server::restore_tensor_extra(ggml_tensor * tensor, bool create_if_missi
 }
 
 void rpc_server::forget_tensor_extras(ggml_backend_buffer_t buffer) {
-    const uint64_t lo = (uint64_t) ggml_backend_buffer_get_base(buffer);
-    const uint64_t hi = lo + ggml_backend_buffer_get_size(buffer);
-    for (auto it = tensor_extras.begin(); it != tensor_extras.end(); ) {
-        it = (it->first >= lo && it->first < hi) ? tensor_extras.erase(it) : std::next(it);
-    }
+    // Drop by identity. Deriving a range from get_base()/get_size() is unsound:
+    // get_base() is not required to return a real address, and on OpenCL it
+    // returns the alignment constant, so that range covers the same offsets in
+    // every other OpenCL buffer as well.
+    tensor_extras.erase(buffer);
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
@@ -1879,7 +1897,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     // business knowing about, and it is keyed by a pointer the client already has.
     ggml_backend_buffer_t buffer = tensor->buffer;
     if (buffer && buffer->iface.init_tensor) {
-        if (tensor->data != nullptr && tensor_extras.find((uint64_t) tensor->data) == tensor_extras.end()) {
+        if (tensor->data != nullptr && find_tensor_extra(tensor) == nullptr) {
             buffer->iface.init_tensor(buffer, tensor);
             remember_tensor_extra(tensor);
         }
