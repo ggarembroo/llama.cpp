@@ -38,6 +38,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -313,6 +314,43 @@ static ADRENO_GPU_GEN get_adreno_gpu_gen(const char *device_name) {
     return ADRENO_GPU_GEN::ADRENO_UNKNOWN;
 }
 
+// Name of a generation, for GGML_OPENCL_FORCE_ADRENO_GEN. Accepts the tier name
+// ("A7X") or a bare model number ("740"), the same strings get_adreno_gpu_gen reads
+// out of a device string.
+static bool parse_adreno_gen_name(const char * s, ADRENO_GPU_GEN * out) {
+    static const struct { const char * name; ADRENO_GPU_GEN gen; } table[] = {
+        { "A6X",     ADRENO_GPU_GEN::A6X            },
+        { "A7X",     ADRENO_GPU_GEN::A7X            },
+        { "A8X",     ADRENO_GPU_GEN::A8X            },
+        { "X1E",     ADRENO_GPU_GEN::X1E            },
+        { "X2E",     ADRENO_GPU_GEN::X2E            },
+        { "UNKNOWN", ADRENO_GPU_GEN::ADRENO_UNKNOWN },
+    };
+    for (const auto & e : table) {
+        const char * a = s;
+        const char * b = e.name;
+        while (*a != '\0' && *b != '\0') {
+            const char ca = (*a >= 'a' && *a <= 'z') ? (char) (*a - 'a' + 'A') : *a;
+            if (ca != *b) {
+                break;
+            }
+            a++;
+            b++;
+        }
+        if (*a == '\0' && *b == '\0') {
+            *out = e.gen;
+            return true;
+        }
+    }
+    // A bare model number, the form get_adreno_gpu_gen also reads.
+    const ADRENO_GPU_GEN by_model = get_adreno_gpu_gen(s);
+    if (by_model != ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
+        *out = by_model;
+        return true;
+    }
+    return false;
+}
+
 static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *driver_version) {
     std::string driver_ver_str(driver_version);
     ADRENO_CL_COMPILER_TYPE type = ADRENO_CL_COMPILER_TYPE::E031;
@@ -450,9 +488,11 @@ static void ggml_cl_adreno_xmem_attn_release_scratch(ggml_backend_opencl_context
 #endif
 
 // backend device context
-// Up to this many tokens in flight, the small elementwise ops are left to the CPU.
-// See the comment on ggml_opencl_op_is_small_elementwise.
-#define GGML_OPENCL_SMALL_OPS_MAX_TOKENS_DEFAULT 4
+// The small elementwise ops are left to the CPU while the op itself is no larger than
+// this many bytes. See the comment on ggml_opencl_op_is_small_elementwise.
+// 0 turns the rule off. The shipped value is the one the sweep in PROJECT_BRAIN 213.20
+// picked.
+#define GGML_OPENCL_SMALL_OPS_MAX_BYTES_DEFAULT 0
 
 struct ggml_backend_opencl_device_context {
     cl_platform_id platform;
@@ -476,7 +516,11 @@ struct ggml_backend_opencl_device_context {
 
     std::regex *opfilter = nullptr; // regex of ops to not claim
     std::string opfilter_str = ""; // regex string for opfilter
-    int small_ops_max_tokens = GGML_OPENCL_SMALL_OPS_MAX_TOKENS_DEFAULT;
+    // The byte rule. Supersedes the token rule below it.
+    size_t small_ops_max_bytes  = GGML_OPENCL_SMALL_OPS_MAX_BYTES_DEFAULT;
+    // The older token-count rule, kept so an A/B against the byte rule stays possible.
+    // Off by default - the token count is only a proxy for the size of the op.
+    int    small_ops_max_tokens = 0;
     size_t global_mem_size = 0;
 };
 
@@ -6591,6 +6635,29 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         if (dev_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
             dev_ctx->adreno_gen = get_adreno_gpu_gen(dev_ctx->device_name.c_str());
         }
+
+        // R&D hook (PROJECT_BRAIN 213.17). Fix the generation the kernel-selection
+        // guards see, without touching the hardware. Forcing an older generation onto a
+        // newer chip runs the old chip's code path on known-good silicon, which is how
+        // "the A7X code path is what collapses" is told apart from "the A7X silicon is
+        // what collapses" - one physical GPU, two code paths.
+        {
+            const char * str_force_gen = getenv("GGML_OPENCL_FORCE_ADRENO_GEN");
+            if (str_force_gen != nullptr && str_force_gen[0] != '\0') {
+                ADRENO_GPU_GEN forced = ADRENO_GPU_GEN::ADRENO_UNKNOWN;
+                if (parse_adreno_gen_name(str_force_gen, &forced)) {
+                    const ADRENO_GPU_GEN detected = dev_ctx->adreno_gen;
+                    dev_ctx->adreno_gen = forced;
+                    GGML_LOG_INFO("ggml_opencl: Adreno generation forced to '%s' (detected gen %d) "
+                                  "by GGML_OPENCL_FORCE_ADRENO_GEN\n",
+                                  str_force_gen, (int) detected);
+                } else {
+                    GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_FORCE_ADRENO_GEN='%s' names no generation "
+                                  "(A6X, A7X, A8X, X1E, X2E, unknown, or a model number such as 740); "
+                                  "keeping the detected generation\n", str_force_gen);
+                }
+            }
+        }
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         dev_ctx->gpu_family = GPU_FAMILY::INTEL;
     } else {
@@ -6647,6 +6714,15 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         dev_ctx->opfilter = new std::regex(str_opfilter, std::regex_constants::icase);
     }
 
+    const char * str_small_ops_bytes = getenv("GGML_OPENCL_SMALL_OPS_MAX_BYTES");
+    if (str_small_ops_bytes) {
+        dev_ctx->small_ops_max_bytes = (size_t) strtoull(str_small_ops_bytes, NULL, 10);
+    }
+    if (dev_ctx->small_ops_max_bytes > 0) {
+        GGML_LOG_INFO("ggml_opencl: NORM, RMS_NORM, ADD, MUL, SILU and ROPE stay on the CPU "
+                      "while the op is at most %zu bytes (GGML_OPENCL_SMALL_OPS_MAX_BYTES)\n",
+                      dev_ctx->small_ops_max_bytes);
+    }
     const char * str_small_ops = getenv("GGML_OPENCL_SMALL_OPS_MAX_TOKENS");
     if (str_small_ops) {
         dev_ctx->small_ops_max_tokens = atoi(str_small_ops);
@@ -8856,8 +8932,20 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 // arithmetic in tens of milliseconds, so for a single token the CPU wins by a wide
 // margin. A prompt of a few hundred tokens is a different story: there the GPU's
 // throughput wins, and forcing these ops off it roughly halves prompt processing
-// (measured: 0.5B pp32 17.13 -> 7.69 t/s, 3B pp32 9.88 -> 4.98 t/s). Hence the rule
-// is conditional on how many tokens are in flight.
+// (measured: 0.5B pp32 17.13 -> 7.69 t/s, 3B pp32 9.88 -> 4.98 t/s).
+//
+// The token count was the first way to express that difference, and it is a proxy.
+// It reads the same "4" for a narrow model at four tokens and a wide one at one, and
+// those want opposite answers - which is why the rule as written helped a 0.5B
+// (generation 26.71 -> 40.14 t/s) and hurt an 8B (86.04 -> 77.26 prompt, 8.55 -> 7.45
+// generation) at the same setting. What actually decides the winner is the size of the
+// op: the GPU wins once nbytes/gpu_bandwidth exceeds the fixed dispatch cost, and the
+// CPU wins below the point where nbytes/cpu_bandwidth stops covering the transfer of
+// the op across the host/device boundary. Both sides are linear in nbytes, so the
+// crossover is one number of bytes and no token count needs to be consulted.
+//
+// GGML_OPENCL_SMALL_OPS_MAX_BYTES is that number. GGML_OPENCL_SMALL_OPS_MAX_TOKENS
+// keeps the old rule available for an A/B and is off by default.
 static bool ggml_opencl_op_is_small_elementwise(const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NORM:
@@ -8895,10 +8983,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         return false;
     }
 
-    // Hand the small elementwise ops to the CPU while only a few tokens are in
-    // flight. See the comment on ggml_opencl_op_is_small_elementwise.
-    if (dev_ctx->small_ops_max_tokens > 0 && ggml_opencl_op_is_small_elementwise(op) &&
-        ggml_opencl_op_token_count(op) <= dev_ctx->small_ops_max_tokens) {
+    // Hand the small elementwise ops to the CPU while the op is small enough that
+    // getting it onto the GPU costs more than doing it. See the comment on
+    // ggml_opencl_op_is_small_elementwise.
+    if (ggml_opencl_op_is_small_elementwise(op) &&
+        ((dev_ctx->small_ops_max_bytes > 0 && ggml_nbytes(op) <= dev_ctx->small_ops_max_bytes) ||
+         (dev_ctx->small_ops_max_tokens > 0 &&
+          ggml_opencl_op_token_count(op) <= dev_ctx->small_ops_max_tokens))) {
         return false;
     }
 
